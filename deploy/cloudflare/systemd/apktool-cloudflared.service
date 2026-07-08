@@ -1,0 +1,15 @@
+[Unit]
+Description=cloudflared tunnel for apktool.thewilners.com
+After=network.target
+
+[Service]
+Type=simple
+Environment=TUNNEL_TOKEN=
+# Set TUNNEL_TOKEN in an override:
+# systemctl --user edit --force --full apktool-cloudflared.service
+ExecStart=/usr/bin/env cloudflared tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

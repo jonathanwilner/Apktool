@@ -6,6 +6,17 @@ gradle.properties
 # Build
 **/build/
 
+# Node / Vite
+web/node_modules/
+web/dist/
+result
+result-*
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+
 # Eclipse
 **/nbproject/private/
 *.project
