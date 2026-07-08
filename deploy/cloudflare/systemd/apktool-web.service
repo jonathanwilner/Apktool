@@ -1,0 +1,18 @@
+[Unit]
+Description=apktool-web (local)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jonathan/src/apktool
+Environment=HOST=127.0.0.1
+Environment=PORT=8787
+Environment=REQUIRE_CF_ACCESS=1
+# Comma-separated list. Optional; if unset, only checks for presence of Access email header.
+# Environment=ALLOWED_EMAILS=you@example.com
+ExecStart=/usr/bin/env nix run .#web
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
