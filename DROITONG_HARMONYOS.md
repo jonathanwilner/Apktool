@@ -4,7 +4,11 @@ This is the default workflow for APKs that need to install through Droitong or H
 
 ## Default Policy
 
-For ordinary third-party apps, publish a standalone merged APK as the primary artifact.
+First inspect the source signature and record its SHA-256. Preserve an existing standalone vendor APK when it already meets the installation need. The web workflow defaults to exact-byte preservation; re-signing requires explicit selection.
+
+For split-only third-party apps that require repacking, publish a standalone merged APK as the primary artifact.
+
+Vendor integrations can depend on the original package, certificate, and a reachable Android service. Aurora's Huawei flavor uses AppGallery's silent-install service; renaming or re-signing does not reproduce that integration or establish a DroiTong bypass. See [the Aurora review](AURORA_HUAWEI_REVIEW.md) and use `scripts/compare-apks.py` to compare independently obtained references before modification. Signature validity and malware assessment are separate findings.
 
 Do not make `.apks`, `.apkm`, `.xapk`, or SAI flows the first recommendation for HarmonyOS/Droitong. HarmonyOS browser downloads can hand SAI a `content://ohos/docs/...` URI that SAI cannot open, and installing only `base.apk` from a split bundle causes invalid or incomplete package errors.
 

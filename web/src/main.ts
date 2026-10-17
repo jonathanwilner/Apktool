@@ -8,6 +8,9 @@ type JobStatus = 'new' | 'uploading' | 'building' | 'done' | 'error';
 
 type JobMeta = {
   originalFilename?: string;
+  operation?: 'preserve' | 'resign';
+  source?: { sha256: string; signature: { status: string; certificatesSha256: string[]; details?: string }; malwareAssessment: string };
+  outputSha256?: string;
   packageName?: string;
   versionName?: string;
   versionCode?: string;
@@ -24,16 +27,19 @@ type Job = {
   outputReady?: boolean;
 };
 
-const app = document.querySelector<HTMLDivElement>('#app');
-if (!app) throw new Error('missing #app');
+const appElement = document.querySelector<HTMLDivElement>('#app');
+if (!appElement) throw new Error('missing #app');
+const app: HTMLDivElement = appElement;
 
 const state: {
+  operation: 'preserve' | 'resign';
   job: Job | null;
   pollTimer: number | null;
   file: File | null;
   analysis: any | null;
   analysisLoading: boolean;
 } = {
+  operation: 'preserve',
   job: null,
   pollTimer: null,
   file: null,
@@ -53,9 +59,9 @@ function render() {
     <main class="shell">
       <header class="hero">
         <div class="hero__tag">apktool-web</div>
-        <h1 class="hero__title">Repackage (resign) APKs for installability.</h1>
+        <h1 class="hero__title">Inspect and preserve APK signatures.</h1>
         <p class="hero__sub">
-          Upload an APK and get back a resigned APK for download. Output is also copied into
+          Check the source SHA-256 and signature, then download the original bytes or explicitly resign. Output is also copied into
           <code>~/mini/Downloads</code>.
         </p>
       </header>
@@ -65,19 +71,21 @@ function render() {
         <div class="uploader" id="dropzone">
           <div class="uploader__inner">
             <div class="uploader__hint">Drop an APK here, or choose a file.</div>
+            <label>Operation <select id="operation"><option value="preserve" ${state.operation === 'preserve' ? 'selected' : ''}>Preserve original bytes and signature</option><option value="resign" ${state.operation === 'resign' ? 'selected' : ''}>Resign with local debug key</option></select></label>
             <div class="uploader__row">
               <input id="file" type="file" accept=".apk" />
               <md-filled-button id="upload" ${uploadDisabled ? 'disabled' : ''}>
-                Upload and repackage
+                Upload and process
               </md-filled-button>
             </div>
             <div class="uploader__file">${state.file ? esc(state.file.name) : 'No file selected'}</div>
           </div>
         </div>
         ${job ? renderStatus(job) : ''}
+        ${job?.meta?.source ? `<p>Source SHA-256: <code>${esc(job.meta.source.sha256)}</code></p><p>Source signature: <strong>${esc(job.meta.source.signature.status)}</strong></p><p>Signer certificate SHA-256: ${job.meta.source.signature.certificatesSha256.map(esc).join(', ') || 'Unavailable'}</p><p>Malware assessment: not performed. A verified signature establishes integrity; publisher trust requires a trusted reference.</p><details><summary>Signature verification details</summary><pre class="logs">${esc(job.meta.source.signature.details || '')}</pre></details>` : ''}
         ${job && job.outputReady ? `
           <div class="actions">
-            <a class="download" href="/api/jobs/${encodeURIComponent(job.id)}/download">Download repacked APK</a>
+            <a class="download" href="/api/jobs/${encodeURIComponent(job.id)}/download">Download ${job.meta?.operation === 'preserve' ? 'original' : 'resigned'} APK</a>
           </div>
         ` : ''}
       </section>
@@ -110,7 +118,7 @@ function render() {
       ` : ''}
 
       <footer class="footer">
-        <div class="footer__pill">Note: This flow resigns the APK. It does not rebuild resources or change the manifest.</div>
+        <div class="footer__pill">Preserve keeps the APK unchanged. Resigning replaces publisher identity and may break updates or signature-based features. Neither operation proves Huawei or Droitong compatibility or malware safety.</div>
       </footer>
     </main>
   `;
@@ -124,7 +132,7 @@ function renderStatus(job: Job) {
       ? `<div class="status status--err">Error: ${esc(job.error || 'unknown error')}</div>`
       : `<div class="status">Status: <strong>${esc(job.status)}</strong>${job.meta?.packageName ? ` • <span class="mono">${esc(job.meta.packageName)}</span>` : ''}</div>`;
 
-  const showProgress = job.status === 'uploading' || job.status === 'decoding' || job.status === 'building';
+  const showProgress = job.status === 'uploading' || job.status === 'building';
   return `
     <div class="statuswrap">
       ${statusLine}
@@ -137,6 +145,10 @@ function wire() {
   const fileEl = document.querySelector<HTMLInputElement>('#file')!;
   const uploadBtn = document.querySelector<HTMLElement>('#upload')!;
   const dropzone = document.querySelector<HTMLElement>('#dropzone')!;
+
+  document.querySelector<HTMLSelectElement>('#operation')!.onchange = (event) => {
+    state.operation = (event.target as HTMLSelectElement).value as 'preserve' | 'resign';
+  };
 
   fileEl.onchange = () => {
     state.file = fileEl.files?.[0] ?? null;
@@ -214,7 +226,7 @@ async function upload(file: File) {
   const fd = new FormData();
   fd.append('apk', file, file.name);
 
-  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const res = await fetch(`/api/upload?operation=${state.operation}`, { method: 'POST', body: fd });
   const data = await res.json();
   if (!res.ok) {
     state.job = { id: '', status: 'error', error: data?.error || `HTTP ${res.status}`, logs: data?.logs || '' };

@@ -1,4 +1,6 @@
 import Fastify from 'fastify';
+import { inspectSource, sha256 } from './provenance.mjs';
+import { pathToFileURL } from 'node:url';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import fastifyStatic from '@fastify/static';
@@ -47,7 +49,7 @@ await fsp.mkdir(JOBS_DIR, { recursive: true });
 await fsp.mkdir(KEYSTORE_DIR, { recursive: true });
 await fsp.mkdir(DOWNLOADS_DIR, { recursive: true });
 
-const app = Fastify({
+export const app = Fastify({
   logger: {
     level: process.env.LOG_LEVEL || 'info'
   },
@@ -103,6 +105,8 @@ if (fs.existsSync(ASSETS_DIR)) {
 app.get('/api/health', async () => ({ ok: true }));
 
 app.post('/api/upload', async (req, reply) => {
+  const operation = req.query.operation || 'preserve';
+  if (!['preserve', 'resign'].includes(operation)) return reply.code(400).send({ error: 'operation must be preserve or resign' });
   const id = crypto.randomBytes(8).toString('hex');
   const jobDir = path.join(JOBS_DIR, id);
   await fsp.mkdir(jobDir, { recursive: true });
@@ -116,7 +120,7 @@ app.post('/api/upload', async (req, reply) => {
     alignedApk: path.join(jobDir, 'aligned.apk'),
     signedApk: path.join(jobDir, 'output.apk'),
     logPath: path.join(jobDir, 'job.log'),
-    meta: {},
+    meta: { operation },
     error: null
   };
   jobs.set(id, job);
@@ -136,6 +140,11 @@ app.post('/api/upload', async (req, reply) => {
     gotApk = true;
     await log(job, `upload: ${part.filename} (${part.mimetype})`);
     await streamToFile(part.file, job.inputApk);
+    if (part.file.truncated) {
+      job.status = 'error';
+      job.error = 'upload exceeds file size limit';
+      return reply.code(413).send(await publicJob(job));
+    }
     job.meta.originalFilename = part.filename;
     break;
   }
@@ -147,7 +156,7 @@ app.post('/api/upload', async (req, reply) => {
     return reply.code(400).send(await publicJob(job));
   }
 
-  // Fire-and-forget resign, client polls.
+  // Inspect and process asynchronously; the client polls.
   if (job.status !== 'building') {
     job.status = 'building';
     job.error = null;
@@ -186,7 +195,7 @@ app.post('/api/jobs/:id/build', async (req, reply) => {
   const job = jobs.get(req.params.id);
   if (!job) return reply.code(404).send({ error: 'job not found' });
 
-  // Backwards-compatible endpoint: "build" now just repackages (resigns).
+  // Retry the operation explicitly selected at upload; never silently change signing identity.
   if (job.status === 'building') return reply.send(await publicJob(job));
   if (job.status === 'done') return reply.send(await publicJob(job));
 
@@ -206,70 +215,84 @@ app.post('/api/jobs/:id/build', async (req, reply) => {
 app.get('/api/jobs/:id/download', async (req, reply) => {
   const job = jobs.get(req.params.id);
   if (!job) return reply.code(404).send({ error: 'job not found' });
-  if (!fs.existsSync(job.signedApk)) return reply.code(409).send({ error: 'output not ready' });
+  if (job.status !== 'done' || !fs.existsSync(job.signedApk)) return reply.code(409).send({ error: 'output not ready' });
 
   const nameBase = (job.meta?.originalFilename || 'repacked.apk').replace(/[^a-zA-Z0-9._-]+/g, '_');
   reply.header('content-type', 'application/vnd.android.package-archive');
-  reply.header('content-disposition', `attachment; filename="${nameBase.replace(/\\.apk$/i, '')}-repacked-${job.id}.apk"`);
+  reply.header('content-disposition', `attachment; filename="${nameBase.replace(/\.apk$/i, '')}-${job.meta.operation}-${job.id}.apk"`);
   return reply.send(fs.createReadStream(job.signedApk));
 });
 
-await app.listen({ host: HOST, port: PORT });
-app.log.info(`listening on http://${HOST}:${PORT}`);
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await app.listen({ host: HOST, port: PORT });
+  app.log.info(`listening on http://${HOST}:${PORT}`);
+}
 
 async function repackageJob(job) {
   await log(job, 'repackage: start');
   await log(job, `repackage: retries=${CMD_RETRIES} retryDelayMs=${CMD_RETRY_DELAY_MS}`);
   await log(job, `repackage: timeouts zipalign=${TIMEOUT_ZIPALIGN_MS}ms sign=${TIMEOUT_SIGN_MS}ms verify=${TIMEOUT_VERIFY_MS}ms`);
 
-  await ensureDebugKeystore(job);
+  job.meta.source = await inspectSource(job.inputApk, APKSIGNER_BIN, TIMEOUT_VERIFY_MS);
+  await log(job, `source SHA-256: ${job.meta.source.sha256}; signature: ${job.meta.source.signature.status}`);
+  await log(job, 'Signature verification checks integrity. Publisher trust and malware assessment require separate evidence.');
+  if (job.meta.operation === 'preserve') {
+    await fsp.copyFile(job.inputApk, job.signedApk);
+  } else {
+    await ensureDebugKeystore(job);
 
-  // zipalign is optional; if missing, we still sign the original input apk.
-  let signInput = job.inputApk;
-  if (ZIPALIGN_BIN) {
-    const ok = await maybeZipalign(job, job.inputApk, job.alignedApk);
-    if (ok) signInput = job.alignedApk;
-  }
-
-  await log(job, 'apksigner: sign');
-  await runWithRetries(
-    job,
-    APKSIGNER_BIN,
-    [
-      'sign',
-      '--ks',
-      DEBUG_KEYSTORE,
-      '--ks-key-alias',
-      'androiddebugkey',
-      '--ks-pass',
-      'pass:android',
-      '--key-pass',
-      'pass:android',
-      '--out',
-      job.signedApk,
-      signInput
-    ],
-    { cwd: job.dir },
-    {
-      label: 'apksigner sign',
-      timeoutMs: TIMEOUT_SIGN_MS,
-      retries: CMD_RETRIES,
-      onBeforeAttempt: async () => {
-        await rmRF(job.signedApk);
-      }
+    // zipalign is optional; if missing, we still sign the original input apk.
+    let signInput = job.inputApk;
+    if (ZIPALIGN_BIN) {
+      const ok = await maybeZipalign(job, job.inputApk, job.alignedApk);
+      if (ok) signInput = job.alignedApk;
     }
-  );
 
-  await log(job, 'apksigner: verify');
-  await runWithRetries(job, APKSIGNER_BIN, ['verify', '--verbose', '--print-certs', job.signedApk], { cwd: job.dir }, {
-    label: 'apksigner verify',
-    timeoutMs: TIMEOUT_VERIFY_MS,
-    retries: CMD_RETRIES
-  });
+    await log(job, 'apksigner: sign');
+    await runWithRetries(
+      job,
+      APKSIGNER_BIN,
+      [
+        'sign',
+        '--ks',
+        DEBUG_KEYSTORE,
+        '--ks-key-alias',
+        'androiddebugkey',
+        '--ks-pass',
+        'pass:android',
+        '--key-pass',
+        'pass:android',
+        '--out',
+        job.signedApk,
+        signInput
+      ],
+      { cwd: job.dir },
+      {
+        label: 'apksigner sign',
+        timeoutMs: TIMEOUT_SIGN_MS,
+        retries: CMD_RETRIES,
+        onBeforeAttempt: async () => {
+          await rmRF(job.signedApk);
+        }
+      }
+    );
+
+    await log(job, 'apksigner: verify');
+    await runWithRetries(job, APKSIGNER_BIN, ['verify', '--verbose', '--print-certs', job.signedApk], { cwd: job.dir }, {
+      label: 'apksigner verify',
+      timeoutMs: TIMEOUT_VERIFY_MS,
+      retries: CMD_RETRIES
+    });
+
+  }
+  job.meta.outputSha256 = await sha256(job.signedApk);
+  if (job.meta.operation === 'preserve' && job.meta.outputSha256 !== job.meta.source.sha256) {
+    throw new Error('Original-byte preservation failed');
+  }
 
   // Copy output to ~/mini/Downloads
   const safeBase = (job.meta?.originalFilename || 'output.apk').replace(/[^a-zA-Z0-9._-]+/g, '_');
-  const outName = `${safeBase.replace(/\\.apk$/i, '')}-repacked-${job.id}.apk`;
+  const outName = `${safeBase.replace(/\.apk$/i, '')}-${job.meta.operation}-${job.id}.apk`;
   const outPath = path.join(DOWNLOADS_DIR, outName);
   try {
     await fsp.mkdir(DOWNLOADS_DIR, { recursive: true });
@@ -337,7 +360,7 @@ async function publicJob(job) {
     meta: job.meta,
     error: job.error,
     logs,
-    outputReady: fs.existsSync(job.signedApk)
+    outputReady: job.status === 'done' && fs.existsSync(job.signedApk)
   };
 }
 

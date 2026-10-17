@@ -74,7 +74,7 @@
               # Runtime needs node_modules for server.mjs imports.
               npm prune --omit=dev --silent
               cp -r dist $out/lib/dist
-              cp server.mjs $out/lib/server.mjs
+              cp server.mjs provenance.mjs $out/lib/
               cp -r node_modules $out/lib/node_modules
               runHook postInstall
             '';
